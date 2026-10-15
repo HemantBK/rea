@@ -3,7 +3,11 @@ import { z } from "zod";
 
 import { parseEvidence, type Evidence } from "../domain/evidence.js";
 import { jsonValueSchema, type JsonValue } from "../domain/jsonValue.js";
-import { canonicalJson } from "../domain/comparisonSemantics.js";
+import {
+  canonicalJsonValue,
+  isReaServerName,
+  parseJsonValue,
+} from "./transcriptValues.js";
 
 /** Only authenticated, successful, non-conflicting transcript deliveries. */
 export interface FixtureClaimContext {
@@ -108,18 +112,26 @@ const finalAnswerSchema = z.strictObject({
     }),
   ),
 });
-type FinalClaim = z.infer<typeof finalAnswerSchema>["claims"][number];
+/** One claim exactly as the agent submitted it, before any grading. */
+export type SubmittedClaim = z.infer<
+  typeof finalAnswerSchema
+>["claims"][number];
+
+/** Every submitted claim in order, unknown and duplicate IDs included, rubric or not; undefined unless the message is a closed manifest. */
+export const parseSubmittedClaims = (
+  finalMessage: string,
+): readonly SubmittedClaim[] | undefined => {
+  const manifest = finalAnswerSchema.safeParse(parseClosedJson(finalMessage));
+  return manifest.success ? manifest.data.claims : undefined;
+};
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const record = (value: unknown): Record<string, unknown> | undefined =>
   isRecord(value) ? value : undefined;
 const sameJson = (left: unknown, right: unknown): boolean => {
-  const parsedLeft = jsonValueSchema.safeParse(left);
-  const parsedRight = jsonValueSchema.safeParse(right);
+  const canonicalLeft = canonicalJsonValue(left);
   return (
-    parsedLeft.success &&
-    parsedRight.success &&
-    canonicalJson(parsedLeft.data) === canonicalJson(parsedRight.data)
+    canonicalLeft !== undefined && canonicalLeft === canonicalJsonValue(right)
   );
 };
 
@@ -162,9 +174,10 @@ const parseClosedJson = (text: string): unknown => {
   }
 };
 
-interface DeliveredEvidence {
-  readonly records: Map<string, Evidence>;
-  readonly conflicts: Set<string>;
+/** Authenticated successful deliveries by Evidence ID, and IDs delivered in conflicting forms. */
+export interface DeliveredEvidence {
+  readonly records: ReadonlyMap<string, Evidence>;
+  readonly conflicts: ReadonlySet<string>;
 }
 
 /** One completed tool call, with aliases normalized and successful Evidence authenticated. */
@@ -329,18 +342,18 @@ export const parseCodexToolCall = (
       : item.input !== undefined
         ? item.input
         : {};
-  const parsedArguments = jsonValueSchema.safeParse(argumentsValue);
-  if (!parsedArguments.success) return undefined;
+  const parsedArguments = parseJsonValue(argumentsValue);
+  if (parsedArguments === undefined) return undefined;
   const parsed: ParsedCodexToolCall = {
     item,
     id: typeof item.id === "string" && item.id.length > 0 ? item.id : null,
     server: typeof server === "string" ? server : null,
     tool,
-    arguments: parsedArguments.data,
+    arguments: parsedArguments,
     evidence: [],
   };
   if (
-    parsed.server?.toLowerCase() !== "rea" ||
+    !isReaServerName(parsed.server) ||
     status === "failed" ||
     (item.error !== undefined && item.error !== null)
   )
@@ -350,7 +363,8 @@ export const parseCodexToolCall = (
   return { ...parsed, evidence: artifactDelivery(evidence) };
 };
 
-const collectDeliveredEvidence = (
+/** Authenticated successful Evidence by ID, with IDs delivered in conflicting forms. */
+export const collectDeliveredEvidence = (
   calls: readonly (ParsedCodexToolCall | undefined)[],
 ): DeliveredEvidence => {
   const records = new Map<string, Evidence>();
@@ -366,7 +380,8 @@ const collectDeliveredEvidence = (
   return { records, conflicts };
 };
 
-const matchesSubject = (
+/** Whether Evidence describes the expected local path and, when given, digest. */
+export const matchesSubject = (
   evidence: Evidence,
   expected: { readonly path: string; readonly sha256?: string },
 ): boolean =>
@@ -404,7 +419,7 @@ const matchesLinks = (
 
 const assessClaim = (
   expected: FixtureClaimExpectation,
-  claim: FinalClaim | undefined,
+  claim: SubmittedClaim | undefined,
   delivered: DeliveredEvidence,
 ): FixtureClaimAssessment => {
   const failures: FixtureClaimFailure[] = [];
@@ -466,10 +481,16 @@ export const evaluateKnownAnswers = (
   calls: readonly (ParsedCodexToolCall | undefined)[],
   finalMessage: string,
   expectations: readonly FixtureClaimExpectation[] | undefined,
+  delivered: DeliveredEvidence = collectDeliveredEvidence(calls),
 ): KnownAnswerAssessment => {
   const scope = "configured_fixture_claims";
   if (expectations === undefined)
-    return { scope, status: "not_assessed", manifestFailures: [], claims: [] };
+    return {
+      scope,
+      status: "not_assessed",
+      manifestFailures: [],
+      claims: [],
+    };
   const rubric = z.array(expectationSchema).min(1).safeParse(expectations);
   if (!rubric.success)
     return {
@@ -486,8 +507,8 @@ export const evaluateKnownAnswers = (
       manifestFailures: ["duplicate_fixture_claim_ids"],
       claims: [],
     };
-  const manifest = finalAnswerSchema.safeParse(parseClosedJson(finalMessage));
-  if (!manifest.success)
+  const manifest = parseSubmittedClaims(finalMessage);
+  if (manifest === undefined)
     return {
       scope,
       status: "failed",
@@ -495,15 +516,14 @@ export const evaluateKnownAnswers = (
       claims: [],
     };
   const manifestFailures: string[] = [];
-  const submitted = new Map<string, FinalClaim>();
-  for (const claim of manifest.data.claims) {
+  const submitted = new Map<string, SubmittedClaim>();
+  for (const claim of manifest) {
     if (submitted.has(claim.id))
       manifestFailures.push(`duplicate_claim:${claim.id}`);
     if (!expectedIds.has(claim.id))
       manifestFailures.push(`unknown_claim:${claim.id}`);
     submitted.set(claim.id, claim);
   }
-  const delivered = collectDeliveredEvidence(calls);
   const claims = expectations.map((expected) =>
     assessClaim(expected, submitted.get(expected.id), delivered),
   );

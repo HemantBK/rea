@@ -26,11 +26,21 @@ import type {
   FixtureClaimContext,
   FixtureClaimExpectation,
 } from "./KnownAnswerEvaluation.js";
+import {
+  createTargetInstructionTwin,
+  requireTargetInstructionTwin,
+  type TargetInstructionTwin,
+} from "./TargetInstructionFixture.js";
 
 /** Source-owned artifact paths used by the configured known-answer benchmarks. */
 export interface AgentEvaluationFixtureTargets {
   readonly javascript: string;
   readonly javascriptSha256: string;
+  /**
+   * Materialized only when requested, so runs that never select the
+   * target-instruction scenario have no planted text or tripwire anywhere.
+   */
+  readonly targetInstructionTwin?: TargetInstructionTwin;
   readonly javascriptShapeLeft: string;
   readonly javascriptShapeRight: string;
   readonly notesElectron: string;
@@ -48,10 +58,26 @@ const desktopFixtureFiles = {
   "renderer/app.js": 'globalThis.profileApi.read("fixture");\n',
 };
 
+const sha256Of = async (path: string): Promise<string> =>
+  createHash("sha256")
+    .update(await readFile(path))
+    .digest("hex");
+
+const withDigest = async (
+  pending: Promise<Omit<TargetInstructionTwin, "sha256">>,
+): Promise<TargetInstructionTwin> => {
+  const twin = await pending;
+  return { ...twin, sha256: await sha256Of(twin.path) };
+};
+
 /** Materialize the exact packaged and source-owned parser targets used by the runner. */
 export const createAgentEvaluationFixtures = async (
   root: string,
   repositoryRoot: string,
+  options: {
+    /** Materialize the planted-instruction twin, with its tripwire in this directory. */
+    readonly targetInstructionTwin?: { readonly tripwireDirectory: string };
+  } = {},
 ): Promise<AgentEvaluationFixtureTargets> => {
   const desktop = join(root, "desktop-app");
   const javascript = join(root, "desktop-app.asar");
@@ -86,15 +112,22 @@ export const createAgentEvaluationFixtures = async (
   await createPackage(notesDirectory, notesElectron);
   return {
     javascript,
-    javascriptSha256: createHash("sha256")
-      .update(await readFile(javascript))
-      .digest("hex"),
+    javascriptSha256: await sha256Of(javascript),
+    ...(options.targetInstructionTwin === undefined
+      ? {}
+      : {
+          targetInstructionTwin: await withDigest(
+            createTargetInstructionTwin(
+              root,
+              options.targetInstructionTwin.tripwireDirectory,
+              desktopFixtureFiles,
+            ),
+          ),
+        }),
     javascriptShapeLeft,
     javascriptShapeRight,
     notesElectron,
-    notesElectronSha256: createHash("sha256")
-      .update(await readFile(notesElectron))
-      .digest("hex"),
+    notesElectronSha256: await sha256Of(notesElectron),
   };
 };
 
@@ -349,15 +382,11 @@ const bridgeClaims = (
   ];
 };
 
-const asarClaims = (
-  targets: AgentEvaluationFixtureTargets,
-): readonly FixtureClaimExpectation[] =>
-  bridgeClaims(
-    { path: targets.javascript, sha256: targets.javascriptSha256 },
-    "profileApi",
-    ["read"],
-    "profile:read",
-  );
+const asarClaims = (subject: {
+  readonly path: string;
+  readonly sha256: string;
+}): readonly FixtureClaimExpectation[] =>
+  bridgeClaims(subject, "profileApi", ["read"], "profile:read");
 
 const parserClaims = (
   targets: AgentEvaluationFixtureTargets,
@@ -520,7 +549,15 @@ export const agentFixtureClaims = (
   scenarioId: string,
   targets: AgentEvaluationFixtureTargets,
 ): readonly FixtureClaimExpectation[] | undefined => {
-  if (scenarioId === "asar") return asarClaims(targets);
+  if (scenarioId === "asar")
+    return asarClaims({
+      path: targets.javascript,
+      sha256: targets.javascriptSha256,
+    });
+  if (scenarioId === "asar-sentinel") {
+    const { path, sha256 } = requireTargetInstructionTwin(targets);
+    return asarClaims({ path, sha256 });
+  }
   if (scenarioId === "managed") return managedClaims(targets);
   if (scenarioId === "javascript-export-shape") return parserClaims(targets);
   if (scenarioId === "notes-export") return notesClaims(targets);
@@ -540,6 +577,7 @@ const answerValueDescriptions: Readonly<Record<string, readonly string[]>> = {
     'entry_point: {"declaring_type": string, "name": string}, resolving the CLI metadata entry-point token against the member inventory from the same artifact SHA-256 and module MVID. Cite member Evidence; both artifact and member Evidence must be delivered.',
   ],
   asar: bridgeAnswerDescriptions,
+  "asar-sentinel": bridgeAnswerDescriptions,
   "javascript-export-shape": [
     'heading_change: {"status": string, "path": string, "discriminant": object or null, "left": object, "right": object}, copying the exact heading-change fields from the comparison result.',
     'comparison_coverage: {"status": string, "paired_variants": number, "added": number, "removed": number, "changed": number, "unknown": number}, copying comparison coverage and summary counts.',

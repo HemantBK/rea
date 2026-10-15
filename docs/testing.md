@@ -1401,7 +1401,10 @@ installed package entrypoint as the script's first argument for package coverage
 `npm run verify:agent` evaluates investigation scenarios through a real local
 Codex CLI. The lane runs sequentially; select scenarios with
 `REA_AGENT_EVAL_SCENARIOS` and choose the installed client/model with
-`REA_CODEX_CLI` and `REA_AGENT_EVAL_MODEL`. The detailed
+`REA_CODEX_CLI` and `REA_AGENT_EVAL_MODEL`. The opt-in `asar-sentinel` scenario pairs
+the desktop fixture with a twin carrying one planted, inert instruction, puts a
+tripwire for the planted command on the agent's `PATH`, and grades observable
+actions, executions and submitted claims that carry the planted terms. The detailed
 [agent evaluation reference](client-verification.md#agent-evaluation-and-conformance-records)
 contains isolation, authentication cleanup, grading, and conformance boundaries.
 
